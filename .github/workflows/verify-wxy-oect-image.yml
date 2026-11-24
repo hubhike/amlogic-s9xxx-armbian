@@ -1,7 +1,8 @@
 #==========================================================================
 # Verify the built wxy-oect image really contains the patched kernel + fwx.ko
-# Downloads the release image, mounts its partitions read-only and asserts
-# that every DPI-related file is in place.
+# Downloads the release image, mounts its partitions read-only, asserts that
+# every DPI-related file is in place, and uploads a plain-text report as a
+# release asset so the result is readable without Actions log permissions.
 #==========================================================================
 
 name: Verify wxy-oect fwx image
@@ -13,96 +14,166 @@ on:
       - '.github/workflows/verify-wxy-oect-image.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   TAG: "Armbian_trixie_arm64_server_wxy-oect_fwx_2026.11"
   IMG: "Armbian_26.11.0_rockchip_wxy-oect_trixie_6.12.118_server_2026.11.24.img.gz"
   KO_SHA256: "511fb6c4f8d618e03a042a1dfced699cf3e258cb92b05f9491513c55198b3113"
+  REPORT: "/tmp/verify-report.txt"
 
 jobs:
   verify:
     runs-on: ubuntu-24.04
     steps:
-      - name: Download and decompress image
-        run: |
-          set -e
-          curl -fSL --retry 3 --retry-delay 5 -o /tmp/image.img.gz \
-            "https://github.com/${{ github.repository }}/releases/download/${TAG}/${IMG}"
-          ls -lh /tmp/image.img.gz
-          gunzip -f /tmp/image.img.gz
-          ls -lh /tmp/image.img
-          df -h /tmp | tail -1
-
-      - name: Mount partitions read-only
-        run: |
-          set -e
-          LOOP=$(sudo losetup -f --show -P /tmp/image.img)
-          echo "LOOP_DEV=${LOOP}" >> "${GITHUB_ENV}"
-          sudo partprobe "${LOOP}" || true
-          sleep 3
-          ls -l "${LOOP}"* || true
-          sudo mkdir -p /mnt/boot /mnt/root
-          sudo mount -o ro "${LOOP}p1" /mnt/boot || sudo mount -t vfat -o ro "${LOOP}p1" /mnt/boot
-          sudo mount -o ro "${LOOP}p2" /mnt/root
-          echo "=== p1 mounted ==="
-          sudo ls -l /mnt/boot | head -30
-          echo "=== p2 rootfs top level ==="
-          sudo ls -1 /mnt/root | head -30
-
-      - name: Inspect target files
-        run: |
-          set -e
-          echo "=== /usr/local/lib/fwx ==="
-          sudo ls -l /mnt/root/usr/local/lib/fwx/ || echo "MISSING_DIR"
-          echo "=== unit file ==="
-          sudo cat /mnt/root/etc/systemd/system/fwx-dpi.service || echo "MISSING_UNIT"
-          echo "=== enable symlink ==="
-          sudo ls -l /mnt/root/etc/systemd/system/multi-user.target.wants/ | grep -i fwx || echo "MISSING_LINK"
-          echo "=== /usr/lib/modules ==="
-          sudo ls -1 /mnt/root/usr/lib/modules/
-          echo "=== kernel headers ==="
-          sudo ls -1d /mnt/root/usr/src/linux-headers-* || true
-          echo "=== boot files with kernel signature ==="
-          sudo find /mnt/boot -maxdepth 2 -name '*6.12.118-fwx*' -printf '%y %p\n' || true
-          echo "=== extlinux.conf ==="
-          sudo cat /mnt/boot/extlinux/extlinux.conf 2>/dev/null || sudo cat /mnt/boot/extlinux.conf 2>/dev/null || echo "NO_EXTLINUX"
-          echo "=== dtb present? ==="
-          sudo find /mnt/boot -name 'rk3566-wxy-oec-turbo-4g.dtb' -printf '%p\n' || true
-
-      - name: Assert content
+      - name: Download, mount, inspect and assert
+        id: check
         run: |
           set +e
+          R="${REPORT}"
+          : > "${R}"
+          log() { echo "$@" | tee -a "${R}"; }
+          T0=$(date +%s)
+
+          log "=============================================="
+          log " wxy-oect image content verification"
+          log " repo   : ${{ github.repository }}"
+          log " tag    : ${TAG}"
+          log " image  : ${IMG}"
+          log " run    : ${{ github.run_id }} / attempt ${{ github.run_attempt }}"
+          log " time   : $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+          log "=============================================="
+          log ""
+
+          log "--- 1. download ---"
+          curl -fSL --retry 3 --retry-delay 5 -o /tmp/image.img.gz \
+            "https://github.com/${{ github.repository }}/releases/download/${TAG}/${IMG}" 2>&1 | tail -2 | tee -a "${R}"
+          ls -l /tmp/image.img.gz | tee -a "${R}"
+          log "downloaded in $(( $(date +%s) - T0 ))s"
+
+          log ""
+          log "--- 2. decompress ---"
+          gunzip -f /tmp/image.img.gz
+          ls -l /tmp/image.img | tee -a "${R}"
+
+          log ""
+          log "--- 3. partition layout ---"
+          sudo fdisk -l /tmp/image.img 2>&1 | tail -8 | tee -a "${R}"
+
+          log ""
+          log "--- 4. mount ---"
+          LOOP=$(sudo losetup -f --show -P /tmp/image.img)
+          log "loop device: ${LOOP}"
+          sleep 3
+          ls -l "${LOOP}"* 2>&1 | tee -a "${R}"
+          sudo mkdir -p /mnt/boot /mnt/root
+          sudo mount -o ro "${LOOP}p1" /mnt/boot || sudo mount -t vfat -o ro "${LOOP}p1" /mnt/boot
+          MNT_BOOT=$?
+          sudo mount -o ro "${LOOP}p2" /mnt/root
+          MNT_ROOT=$?
+          log "mount p1 rc=${MNT_BOOT}  p2 rc=${MNT_ROOT}"
+
+          log ""
+          log "--- 5. /boot contents ---"
+          sudo ls -l /mnt/boot 2>&1 | head -25 | tee -a "${R}"
+
+          log ""
+          log "--- 6. /usr/local/lib/fwx ---"
+          sudo ls -l /mnt/root/usr/local/lib/fwx 2>&1 | tee -a "${R}"
+
+          log ""
+          log "--- 7. systemd unit ---"
+          sudo cat /mnt/root/etc/systemd/system/fwx-dpi.service 2>&1 | tee -a "${R}"
+
+          log ""
+          log "--- 8. enable symlink ---"
+          sudo ls -l /mnt/root/etc/systemd/system/multi-user.target.wants/ 2>&1 | grep -i fwx | tee -a "${R}"
+
+          log ""
+          log "--- 9. /usr/lib/modules ---"
+          sudo ls -1 /mnt/root/usr/lib/modules/ 2>&1 | tee -a "${R}"
+
+          log ""
+          log "--- 10. kernel headers ---"
+          sudo ls -1d /mnt/root/usr/src/linux-headers-* 2>&1 | tee -a "${R}"
+
+          log ""
+          log "--- 11. boot files carrying the -fwx signature ---"
+          sudo find /mnt/boot -maxdepth 2 -name '*6.12.118-fwx*' -printf '%y %p\n' 2>&1 | tee -a "${R}"
+
+          log ""
+          log "--- 12. extlinux.conf ---"
+          ( sudo cat /mnt/boot/extlinux/extlinux.conf 2>/dev/null || sudo cat /mnt/boot/extlinux.conf 2>/dev/null ) | tee -a "${R}"
+
+          log ""
+          log "--- 13. device tree blob ---"
+          sudo find /mnt/boot -name 'rk3566-wxy-oec-turbo-4g.dtb' -printf '%p\n' 2>&1 | tee -a "${R}"
+
+          log ""
+          log "--- 14. os-release ---"
+          sudo grep -E '^(PRETTY_NAME|VERSION_CODENAME)=' /mnt/root/etc/os-release 2>&1 | tee -a "${R}"
+
+          log ""
+          log "--- 15. fwx.ko integrity ---"
+          ACTUAL=$(sudo sha256sum /mnt/root/usr/local/lib/fwx/fwx.ko 2>/dev/null | awk '{print $1}')
+          log "expected: ${KO_SHA256}"
+          log "actual  : ${ACTUAL}"
+          sudo strings /mnt/root/usr/local/lib/fwx/fwx.ko 2>/dev/null | grep -m1 '6\.12\.118' | tee -a "${R}"
+
+          log ""
+          log "--- 16. verdict ---"
           fail=0
-          check() { if sudo test -e "$1"; then echo "OK   $1"; else echo "FAIL $1"; fail=1; fi; }
+          check() {
+            if sudo test -e "$1"; then log "OK    $1"; else log "FAIL  $1"; fail=1; fi
+          }
           check /mnt/root/usr/local/lib/fwx/fwx.ko
           check /mnt/root/etc/systemd/system/fwx-dpi.service
           check /mnt/root/etc/systemd/system/multi-user.target.wants/fwx-dpi.service
           check /mnt/root/usr/lib/modules/6.12.118-fwx
           check /mnt/root/usr/src/linux-headers-6.12.118-fwx
-
-          echo "=== ko sha256 (expect ${KO_SHA256}) ==="
-          ACTUAL=$(sudo sha256sum /mnt/root/usr/local/lib/fwx/fwx.ko 2>/dev/null | awk '{print $1}')
-          echo "actual: ${ACTUAL}"
           if [[ "${ACTUAL}" == "${KO_SHA256}" ]]; then
-            echo "OK   fwx.ko sha256 matches"
+            log "OK    fwx.ko sha256 matches the locally built module"
           else
-            echo "FAIL fwx.ko sha256 mismatch or missing"
-            fail=1
+            log "FAIL  fwx.ko sha256 mismatch"; fail=1
+          fi
+          if sudo test -e /mnt/boot/vmlinuz-6.12.118-fwx; then
+            log "OK    /boot/vmlinuz-6.12.118-fwx"
+          else
+            log "FAIL  /boot/vmlinuz-6.12.118-fwx"; fail=1
           fi
 
-          echo "=== vermagic inside image ko ==="
-          sudo strings /mnt/root/usr/local/lib/fwx/fwx.ko 2>/dev/null | grep -m1 '6.12.118' || echo "NO_VERMAGIC_STRING"
-
-          if [[ "${fail}" -ne 0 ]]; then
-            echo "::error::Image verification FAILED"
-            exit 1
+          log ""
+          if [[ "${fail}" -eq 0 ]]; then
+            log "RESULT: PASS - image contains patched kernel and fwx.ko"
+          else
+            log "RESULT: FAIL - see items marked FAIL above"
           fi
-          echo "Image verification PASSED"
+          log "total elapsed: $(( $(date +%s) - T0 ))s"
 
-      - name: Unmount
+          echo "verify_fail=${fail}" >> "${GITHUB_OUTPUT}"
+
+          sudo umount -l /mnt/root 2>/dev/null
+          sudo umount -l /mnt/boot 2>/dev/null
+          sudo losetup -d "${LOOP}" 2>/dev/null
+          exit 0
+
+      - name: Publish report as release asset
         if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sudo umount -l /mnt/root 2>/dev/null || true
-          sudo umount -l /mnt/boot 2>/dev/null || true
-          sudo losetup -d "${LOOP_DEV}" 2>/dev/null || true
+          set -e
+          test -s "${REPORT}" || { echo "no report generated"; exit 1; }
+          cat "${REPORT}"
+          gh release view verify-report --repo "${{ github.repository }}" >/dev/null 2>&1 \
+            || gh release create verify-report --repo "${{ github.repository }}" \
+                 --title "wxy-oect image verification report" \
+                 --notes "Auto-generated content verification for the wxy-oect fwx image."
+          gh release upload verify-report "${REPORT}" --repo "${{ github.repository }}" --clobber
+          echo "report uploaded"
+
+      - name: Fail job if verification failed
+        if: steps.check.outputs.verify_fail != '0'
+        run: |
+          echo "::error::Image verification FAILED - read the verify-report asset"
+          exit 1
