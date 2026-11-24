@@ -74,12 +74,16 @@ jobs:
         id: down
         working-directory: /builder
         run: |
+          rm -rf build
           git clone -q --single-branch --depth=1 --branch=main https://github.com/armbian/build.git build
-          ln -sf /builder/build ${{ github.workspace }}/build
-          ln -sf /builder/build /home/runner/work/_actions/ophub/amlogic-s9xxx-armbian/main/build
+          # Local action (uses: ./) runs with action_path == workspace, so the rebuild
+          # script only needs ./build at the repo root. The original _actions/ symlink
+          # is only required when using 'uses: ophub/...@main' and must not be used here.
+          ln -sfn /builder/build "${{ github.workspace }}/build"
+          ls -ld "${{ github.workspace }}/build"
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: Compile base Armbian rootfs [ ${{ env.RELEASE }} ]
+      - name: Compile base Armbian rootfs
         id: compile
         working-directory: /builder
         run: |
@@ -120,29 +124,37 @@ jobs:
           done
           echo "All 4 kernel packages + sha256sums present. OK"
 
-      - name: Prepare fwx.ko injection files
+      - name: Inject fwx.ko into common-files
         id: fwxprep
         run: |
-          set -e
-          INJ="${{ github.workspace }}/fwx-inject"
-          mkdir -p "${INJ}/usr/local/lib/fwx" \
-                   "${INJ}/etc/systemd/system" \
-                   "${INJ}/etc/systemd/system/multi-user.target.wants"
+          set -euo pipefail
+          # NOTE: the rebuild action's armbian_files copy uses a relative target while
+          # CWD is build/output/images, so it silently no-ops. We therefore write the
+          # files straight into armbian-files/common-files, which copy_files() always
+          # copies into the final rootfs.
+          COMMON="${{ github.workspace }}/build-armbian/armbian-files/common-files"
+          [[ -d "${COMMON}" ]] || { echo "ERROR: common-files dir not found: ${COMMON}"; exit 1; }
+          mkdir -p "${COMMON}/usr/local/lib/fwx" \
+                   "${COMMON}/etc/systemd/system/multi-user.target.wants"
           curl -fsSL --retry 5 --retry-delay 10 \
             "https://github.com/hubhike/fanchmwrt/releases/download/${{ env.FWX_KO_REPO_TAG }}/fwx-${{ env.KERNEL_NAME }}.ko" \
-            -o "${INJ}/usr/local/lib/fwx/fwx.ko"
-          ls -lh "${INJ}/usr/local/lib/fwx/fwx.ko"
-          sha256sum "${INJ}/usr/local/lib/fwx/fwx.ko"
-          echo 'W1VuaXRdCkRlc2NyaXB0aW9uPUZhbmNobVdydCBEUEkga2VybmVsIG1vZHVsZSAoZnd4LmtvKQpBZnRlcj1sb2NhbC1mcy50YXJnZXQKQ29uZGl0aW9uUGF0aEV4aXN0cz0vdXNyL2xvY2FsL2xpYi9md3gvZnd4LmtvCgpbU2VydmljZV0KVHlwZT1vbmVzaG90ClJlbWFpbkFmdGVyRXhpdD15ZXMKRXhlY1N0YXJ0PS9zYmluL2luc21vZCAvdXNyL2xvY2FsL2xpYi9md3gvZnd4LmtvCkV4ZWNTdG9wPS9zYmluL3JtbW9kIGZ3eAoKW0luc3RhbGxdCldhbnRlZEJ5PW11bHRpLXVzZXIudGFyZ2V0Cg==' | base64 -d > "${INJ}/etc/systemd/system/fwx-dpi.service"
-          ln -sf ../fwx-dpi.service "${INJ}/etc/systemd/system/multi-user.target.wants/fwx-dpi.service"
+            -o "${COMMON}/usr/local/lib/fwx/fwx.ko"
+          echo 'W1VuaXRdCkRlc2NyaXB0aW9uPUZhbmNobVdydCBEUEkga2VybmVsIG1vZHVsZSAoZnd4LmtvKQpBZnRlcj1sb2NhbC1mcy50YXJnZXQKQ29uZGl0aW9uUGF0aEV4aXN0cz0vdXNyL2xvY2FsL2xpYi9md3gvZnd4LmtvCgpbU2VydmljZV0KVHlwZT1vbmVzaG90ClJlbWFpbkFmdGVyRXhpdD15ZXMKRXhlY1N0YXJ0PS9iaW4vc2ggLWMgJ2luc21vZCAvdXNyL2xvY2FsL2xpYi9md3gvZnd4LmtvJwpFeGVjU3RvcD0vYmluL3NoIC1jICdybW1vZCBmd3ggfHwgdHJ1ZScKCltJbnN0YWxsXQpXYW50ZWRCeT1tdWx0aS11c2VyLnRhcmdldAo=' | base64 -d > "${COMMON}/etc/systemd/system/fwx-dpi.service"
+          ln -sfn ../fwx-dpi.service "${COMMON}/etc/systemd/system/multi-user.target.wants/fwx-dpi.service"
+          chmod 0644 "${COMMON}/usr/local/lib/fwx/fwx.ko"
+          chmod 0644 "${COMMON}/etc/systemd/system/fwx-dpi.service"
           echo "=== fwx-dpi.service ==="
-          cat "${INJ}/etc/systemd/system/fwx-dpi.service"
-          echo "=== injection tree ==="
-          find "${INJ}" -maxdepth 5 -printf '%y %p\n'
+          cat "${COMMON}/etc/systemd/system/fwx-dpi.service"
+          echo "=== sha256 ==="
+          sha256sum "${COMMON}/usr/local/lib/fwx/fwx.ko"
+          test -s "${COMMON}/usr/local/lib/fwx/fwx.ko"
+          test -f "${COMMON}/etc/systemd/system/fwx-dpi.service"
+          test -L "${COMMON}/etc/systemd/system/multi-user.target.wants/fwx-dpi.service"
+          echo "fwx.ko + unit injected into common-files OK"
 
-      - name: Rebuild Armbian for ${{ env.BOARD }} with patched kernel
+      - name: Rebuild Armbian image with patched kernel
         uses: ./
-        if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
+        if: ${{ steps.clean.outputs.status == 'success' && steps.kprep.outcome == 'success' && steps.fwxprep.outcome == 'success' && !cancelled() }}
         with:
           build_target: armbian
           armbian_path: build/output/images/*.img.gz
@@ -153,7 +165,6 @@ jobs:
           kernel_usage: stable
           armbian_fstype: ext4
           builder_name: fwx
-          armbian_files: fwx-inject
 
       - name: Upload image to Release
         uses: ophub/upload-to-releases@main
