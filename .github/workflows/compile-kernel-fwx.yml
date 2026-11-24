@@ -2,6 +2,10 @@ name: Compile kernel 6.12 with FanchmWrt fwx DPI patch
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/compile-kernel-fwx.yml'
 
 permissions:
   contents: write
@@ -43,6 +47,12 @@ jobs:
           sha=$(curl -fsSL -m 20 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/unifreq/linux-6.12.y/git/ref/heads/main | jq -r '.object.sha')
           [ -z "$sha" ] && sha="${{ github.sha }}"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /builder/ccache
+          key: kernel-fwx-6.12-${{ steps.hash.outputs.sha }}
+          restore-keys: kernel-fwx-6.12-
       - name: Compile kernel 6.12 with fwx patch
         uses: hubhike/amlogic-s9xxx-armbian@main
         with:
